@@ -86,7 +86,7 @@ def decode(source):
             warnings.simplefilter('error', Image.DecompressionBombWarning)
             with Image.open(source) as picture:
                 picture = ImageOps.exif_transpose(picture).convert('RGB')
-                picture.thumbnail((2000, 2000))
+                picture.thumbnail((1200, 1200))
                 return cv2.cvtColor(np.array(picture), cv2.COLOR_RGB2BGR)
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError,
             Image.DecompressionBombWarning) as exc:
@@ -99,7 +99,7 @@ class Faces:
         recognizer = BASE / 'models' / 'face_recognition_sface_2021dec.onnx'
         if not detector.exists() or not recognizer.exists():
             download_models_if_needed()
-        self.detector = cv2.FaceDetectorYN.create(str(detector), '', (320, 320), 0.85)
+        self.detector = cv2.FaceDetectorYN.create(str(detector), '', (320, 320), 0.70)
         self.recognizer = cv2.FaceRecognizerSF.create(str(recognizer), '')
 
     def features(self, picture):
@@ -229,18 +229,21 @@ def search():
         features = engine.features(picture)
         if len(features) == 0:
             return jsonify(error='No face detected in the photo. Please use a clear, front-facing selfie.'), 400
-        if len(features) > 1:
-            return jsonify(error='Multiple faces detected. Please upload a photo with only your face.'), 400
 
-        query = np.array(features[0], dtype=np.float32)
+        # Match across all faces detected in the uploaded photo
+        query_vectors = [np.array(f, dtype=np.float32) for f in features]
         matches = []
         for name, entry in records.items():
             if not entry.get('faces'):
                 continue
             face_matrix = np.array(entry['faces'], dtype=np.float32)
-            score = float(np.max(face_matrix @ query))
-            if score >= THRESHOLD:
-                matches.append({'name': name, 'score': round(score, 4)})
+            best_score = 0.0
+            for q in query_vectors:
+                s = float(np.max(face_matrix @ q))
+                if s > best_score:
+                    best_score = s
+            if best_score >= THRESHOLD:
+                matches.append({'name': name, 'score': round(best_score, 4)})
 
         matches.sort(key=lambda item: item['score'], reverse=True)
 
