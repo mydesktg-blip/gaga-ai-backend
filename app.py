@@ -8,15 +8,14 @@ import os
 from pathlib import Path
 import threading
 import time
-import urllib.request
 import warnings
+import requests
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from werkzeug.exceptions import RequestEntityTooLarge
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE.parent
@@ -24,7 +23,7 @@ IMAGES = PUBLIC / 'images'
 CACHE = BASE / 'data' / 'faces.json'
 DOWNLOAD_CACHE = BASE / 'data' / 'download_cache'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
-THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.45'))
+THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.42'))
 REMOTE_GALLERY = os.getenv('REMOTE_GALLERY', 'https://rarebook.in/gaga_collection').rstrip('/')
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
@@ -48,28 +47,33 @@ except Exception as e:
 
 def safe_files():
     local_files = {}
-    if IMAGES.exists():
-        local_files = {p.relative_to(IMAGES).as_posix(): p for p in IMAGES.rglob('*')
-                       if p.is_file() and not p.is_symlink() and p.suffix.lower() in EXTENSIONS}
-    if local_files:
-        return local_files
+    if IMAGES.exists() and any(IMAGES.iterdir()):
+        for p in IMAGES.rglob('*'):
+            if p.is_file() and not p.is_symlink() and p.suffix.lower() in EXTENSIONS:
+                local_files[p.name] = p
+        if local_files:
+            return local_files
 
-    # Remote fallback to Hostinger
+    # Remote sync from Hostinger
     DOWNLOAD_CACHE.mkdir(parents=True, exist_ok=True)
     try:
-        req = urllib.request.Request(f"{REMOTE_GALLERY}/get_images.php", headers={'User-Agent': 'RaniAI/1.0'})
-        with urllib.request.urlopen(req, timeout=15) as res:
-            img_list = json.loads(res.read().decode())
-            for name in img_list:
-                local_path = DOWNLOAD_CACHE / name
-                if not local_path.exists():
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(f"{REMOTE_GALLERY}/get_images.php", timeout=15, headers=headers)
+        if r.status_code == 200:
+            names = r.json()
+            for name in names:
+                clean_name = name.split('/')[-1]
+                target_path = DOWNLOAD_CACHE / clean_name
+                if not target_path.exists() or target_path.stat().st_size == 0:
                     try:
-                        img_url = f"{REMOTE_GALLERY}/images/{urllib.parse.quote(name)}"
-                        urllib.request.urlretrieve(img_url, local_path)
+                        img_url = f"{REMOTE_GALLERY}/images/{requests.utils.quote(clean_name)}"
+                        resp = requests.get(img_url, timeout=30, headers=headers)
+                        if resp.status_code == 200:
+                            target_path.write_bytes(resp.content)
                     except Exception as err:
-                        logging.warning('Could not download %s: %s', name, err)
-                if local_path.exists():
-                    local_files[name] = local_path
+                        logging.warning('Download error for %s: %s', clean_name, err)
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    local_files[clean_name] = target_path
     except Exception as e:
         logging.warning('Remote gallery sync error: %s', e)
 
@@ -129,7 +133,7 @@ def refresh():
                 else:
                     entry = {'stamp': stamp, 'faces': engine.features(decode(path))}
             updated[name] = entry
-        except (ValueError, OSError, cv2.error) as err:
+        except Exception as err:
             logging.warning('Skipped unreadable photo %s: %s', name, err)
             with lock:
                 state['skipped'] += 1
@@ -169,7 +173,13 @@ def index_loop():
 
 @app.route('/')
 def home():
-    return jsonify(service='RANI AI Face Matching Engine', status='active', ready=state['ready'], total_photos=state['total'])
+    return jsonify(
+        service='RANI AI Face Matching Engine',
+        status='active',
+        ready=state['ready'],
+        total_photos=state['total'],
+        face_photos=state['face_photos']
+    )
 
 
 @app.route('/api/status')
@@ -177,6 +187,23 @@ def home():
 def status():
     with lock:
         return jsonify(dict(state))
+
+
+@app.route('/api/sync')
+def sync():
+    refresh()
+    return jsonify(dict(state))
+
+
+@app.before_request
+def ensure_indexed():
+    if request.path.startswith('/api/'):
+        if not state['ready'] or engine is None or len(records) == 0:
+            if not state['indexing']:
+                try:
+                    refresh()
+                except Exception as err:
+                    logging.warning('Auto-indexing error: %s', err)
 
 
 @app.route('/api/search', methods=['POST'])
@@ -190,10 +217,15 @@ def search():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
+    if not state['ready'] or engine is None or len(records) == 0:
+        try:
+            refresh()
+        except Exception as err:
+            logging.error('On-demand refresh error: %s', err)
+
     with lock:
-        if not state['ready'] or state['error']:
-            if engine is None:
-                return jsonify(error='AI engine is preparing. Please try again in 5 seconds.'), 503
+        if engine is None:
+            return jsonify(error='AI engine is preparing. Please try again in a few seconds.'), 503
         features = engine.features(picture)
         if len(features) == 0:
             return jsonify(error='No face detected in the photo. Please use a clear, front-facing selfie.'), 400
@@ -229,8 +261,11 @@ def start_indexer():
     threading.Thread(target=index_loop, daemon=True, name='album-indexer').start()
 
 
-# Auto-start indexing on import (for gunicorn/waitress)
 start_indexer()
+try:
+    refresh()
+except Exception as e:
+    logging.warning('Initial indexing warning: %s', e)
 
 if __name__ == '__main__':
     from waitress import serve
