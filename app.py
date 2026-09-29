@@ -27,7 +27,7 @@ CACHE = BASE / 'data' / 'faces.json'
 DOWNLOAD_CACHE = BASE / 'data' / 'index_work'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 INDEX_VERSION = 3
-THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.42'))
+THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.38'))
 BUILD = 'gaga-index-v6'
 GALLERY_SOURCE = os.getenv('GALLERY_SOURCE', 'remote').lower()
 cv2.setNumThreads(1)
