@@ -1,6 +1,7 @@
 """Database-free folder album with YuNet detection and SFace matching.
 Supports standalone Cloud deployment (Render) with remote Hostinger gallery sync.
 """
+import gc
 import io
 import json
 import logging
@@ -86,8 +87,10 @@ def decode(source):
             warnings.simplefilter('error', Image.DecompressionBombWarning)
             with Image.open(source) as picture:
                 picture = ImageOps.exif_transpose(picture).convert('RGB')
-                picture.thumbnail((1200, 1200))
-                return cv2.cvtColor(np.array(picture), cv2.COLOR_RGB2BGR)
+                picture.thumbnail((800, 800))
+                bgr = cv2.cvtColor(np.array(picture), cv2.COLOR_RGB2BGR)
+                del picture
+                return bgr
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError,
             Image.DecompressionBombWarning) as exc:
         raise ValueError('Please use a valid JPG, PNG or WebP photo under 40 megapixels.') from exc
@@ -116,38 +119,73 @@ class Faces:
 
 def refresh():
     global records, engine
+    if engine is None:
+        engine = Faces()
     files = safe_files()
     with lock:
-        state.update(indexing=True, total=len(files), processed=0, skipped=0, error=None)
-        if engine is None:
-            engine = Faces()
-    updated = {}
+        state.update(indexing=True, total=len(files), error=None)
+        if len(records) > 0:
+            state['ready'] = True
+
+    updated = dict(records)
+    counter = 0
+
     for name, path in sorted(files.items()):
         try:
             stat = path.stat()
             stamp = [stat.st_mtime_ns, stat.st_size]
-            with lock:
-                previous = records.get(name)
-                if previous and previous.get('stamp') == stamp:
-                    entry = previous
-                else:
-                    entry = {'stamp': stamp, 'faces': engine.features(decode(path))}
+            previous = updated.get(name)
+            if previous and previous.get('stamp') == stamp:
+                entry = previous
+            else:
+                img = decode(path)
+                faces = engine.features(img)
+                del img
+                gc.collect()
+                entry = {'stamp': stamp, 'faces': faces}
+
             updated[name] = entry
+            counter += 1
+
+            # Incrementally expose indexed photos so search works immediately
+            with lock:
+                records[name] = entry
+                state['processed'] = len(records)
+                state['ready'] = True
+                if entry.get('faces'):
+                    state['face_photos'] = state.get('face_photos', 0) + 1
+
+            # Save intermediate cache every 25 images so progress is preserved
+            if counter % 25 == 0:
+                try:
+                    CACHE.parent.mkdir(exist_ok=True)
+                    temporary = CACHE.with_suffix('.tmp')
+                    temporary.write_text(json.dumps({'version': 1, 'photos': updated}))
+                    temporary.replace(CACHE)
+                except Exception:
+                    pass
+
         except Exception as err:
             logging.warning('Skipped unreadable photo %s: %s', name, err)
             with lock:
                 state['skipped'] += 1
         finally:
             with lock:
-                state['processed'] += 1
-    CACHE.parent.mkdir(exist_ok=True)
-    temporary = CACHE.with_suffix('.tmp')
-    temporary.write_text(json.dumps({'version': 1, 'photos': updated}))
-    temporary.replace(CACHE)
+                state['processed'] = counter
+
+    try:
+        CACHE.parent.mkdir(exist_ok=True)
+        temporary = CACHE.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'version': 1, 'photos': updated}))
+        temporary.replace(CACHE)
+    except Exception as e:
+        logging.warning('Cache write error: %s', e)
+
     with lock:
         records = updated
         state.update(ready=True, indexing=False,
-                     face_photos=sum(bool(item['faces']) for item in records.values()))
+                     face_photos=sum(bool(item.get('faces')) for item in records.values()))
+    gc.collect()
 
 
 def index_loop():
@@ -168,7 +206,7 @@ def index_loop():
             logging.exception('Album indexing failed: %s', e)
             with lock:
                 state.update(indexing=False, error='Album indexing failed. Check server logs.')
-        time.sleep(30)
+        time.sleep(1200)
 
 
 @app.route('/')
@@ -191,19 +229,15 @@ def status():
 
 @app.route('/api/sync')
 def sync():
-    refresh()
-    return jsonify(dict(state))
+    threading.Thread(target=refresh, daemon=True).start()
+    return jsonify(message='Sync started in background', state=dict(state))
 
 
 @app.before_request
 def ensure_indexed():
     if request.path.startswith('/api/'):
-        if not state['ready'] or engine is None or len(records) == 0:
-            if not state['indexing']:
-                try:
-                    refresh()
-                except Exception as err:
-                    logging.warning('Auto-indexing error: %s', err)
+        if not state['ready'] and not state['indexing']:
+            threading.Thread(target=refresh, daemon=True).start()
 
 
 @app.route('/api/search', methods=['POST'])
@@ -217,35 +251,44 @@ def search():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
-    if not state['ready'] or engine is None or len(records) == 0:
-        try:
-            refresh()
-        except Exception as err:
-            logging.error('On-demand refresh error: %s', err)
+    # If indexing isn't finished yet, give it up to 10 seconds
+    for _ in range(10):
+        if state['ready'] and engine is not None and len(records) > 0:
+            break
+        if not state['indexing']:
+            threading.Thread(target=refresh, daemon=True).start()
+        time.sleep(1)
 
     with lock:
-        if engine is None:
-            return jsonify(error='AI engine is preparing. Please try again in a few seconds.'), 503
-        features = engine.features(picture)
-        if len(features) == 0:
-            return jsonify(error='No face detected in the photo. Please use a clear, front-facing selfie.'), 400
+        engine_ready = engine is not None
+        records_snapshot = dict(records)
 
-        # Match across all faces detected in the uploaded photo
-        query_vectors = [np.array(f, dtype=np.float32) for f in features]
-        matches = []
-        for name, entry in records.items():
-            if not entry.get('faces'):
-                continue
-            face_matrix = np.array(entry['faces'], dtype=np.float32)
-            best_score = 0.0
-            for q in query_vectors:
-                s = float(np.max(face_matrix @ q))
-                if s > best_score:
-                    best_score = s
-            if best_score >= THRESHOLD:
-                matches.append({'name': name, 'score': round(best_score, 4)})
+    if not engine_ready or len(records_snapshot) == 0:
+        return jsonify(error='AI engine is preparing photos. Please tap Find my photos again in 5 seconds.'), 503
 
-        matches.sort(key=lambda item: item['score'], reverse=True)
+    features = engine.features(picture)
+    if len(features) == 0:
+        return jsonify(error='No face detected in the photo. Please use a clear, front-facing selfie.'), 400
+
+    query_vectors = [np.array(f, dtype=np.float32) for f in features]
+    matches = []
+    for name, entry in records_snapshot.items():
+        if not entry.get('faces'):
+            continue
+        face_matrix = np.array(entry['faces'], dtype=np.float32)
+        best_score = 0.0
+        for q in query_vectors:
+            s = float(np.max(face_matrix @ q))
+            if s > best_score:
+                best_score = s
+        if best_score >= THRESHOLD:
+            matches.append({'name': name, 'score': round(best_score, 4)})
+
+    matches.sort(key=lambda item: item['score'], reverse=True)
+    del picture
+    del features
+    del query_vectors
+    gc.collect()
 
     return jsonify(matches=matches, count=len(matches))
 
@@ -260,15 +303,8 @@ def add_cors_headers(response):
     return response
 
 
-def start_indexer():
-    threading.Thread(target=index_loop, daemon=True, name='album-indexer').start()
-
-
-start_indexer()
-try:
-    refresh()
-except Exception as e:
-    logging.warning('Initial indexing warning: %s', e)
+# Start background indexing loop
+threading.Thread(target=index_loop, daemon=True, name='album-indexer').start()
 
 if __name__ == '__main__':
     from waitress import serve
