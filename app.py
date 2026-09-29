@@ -28,7 +28,7 @@ DOWNLOAD_CACHE = BASE / 'data' / 'index_work'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 INDEX_VERSION = 3
 THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.42'))
-BUILD = 'gaga-index-v3'
+BUILD = 'gaga-index-v4'
 GALLERY_SOURCE = os.getenv('GALLERY_SOURCE', 'remote').lower()
 cv2.setNumThreads(1)
 REMOTE_GALLERY = os.getenv('REMOTE_GALLERY', 'https://rarebook.in/gaga_collection').rstrip('/')
@@ -55,6 +55,7 @@ def gallery_files():
     if GALLERY_SOURCE == 'local':
         return {p.name: p for p in IMAGES.glob('*')
                 if p.is_file() and not p.is_symlink() and p.suffix.lower() in EXTENSIONS}
+    logging.info('Fetching gallery list from %s', REMOTE_GALLERY)
     response = requests.get(f'{REMOTE_GALLERY}/get_images.php', timeout=(10, 30),
                             headers={'User-Agent': 'GAGA-Indexer/3'})
     response.raise_for_status()
@@ -65,6 +66,7 @@ def gallery_files():
         if (not isinstance(name, str) or Path(name).name != name or
                 '\\' in name or Path(name).suffix.lower() not in EXTENSIONS):
             raise ValueError('Gallery returned an invalid filename')
+    logging.info('Gallery list loaded: %s photos', len(names))
     return dict.fromkeys(names)
 
 
@@ -144,9 +146,10 @@ def refresh():
                      stage='loading_gallery', last_photo_error=None)
     try:
         refresh_index()
-    except Exception:
+    except Exception as exc:
         with lock:
-            state.update(ready=False, stage='error', error='Album indexing failed. Check Render logs.')
+            state.update(ready=False, stage='error',
+                         error=f'Album indexing failed: {type(exc).__name__}. Check Render logs.')
         raise
     finally:
         with lock:
@@ -237,7 +240,7 @@ def index_loop():
         except Exception as e:
             logging.exception('Album indexing failed: %s', e)
             with lock:
-                state.update(indexing=False, error='Album indexing failed. Check server logs.')
+                state.update(indexing=False, ready=False, stage='error')
         time.sleep(300)
 
 
@@ -327,10 +330,32 @@ def add_cors_headers(response):
     return response
 
 
-# Start background indexing loop
-threading.Thread(target=index_loop, daemon=True, name='album-indexer').start()
+# Do not start threads during import: Gunicorn may preload this module in its
+# master process. Only the worker serving requests should start the indexer.
+indexer_start_lock = threading.Lock()
+indexer_thread = None
+indexer_pid = None
+
+
+def start_indexer():
+    global indexer_thread, indexer_pid
+    with indexer_start_lock:
+        pid = os.getpid()
+        if indexer_pid == pid and indexer_thread is not None and indexer_thread.is_alive():
+            return
+        indexer_thread = threading.Thread(target=index_loop, daemon=True, name='album-indexer')
+        indexer_pid = pid
+        state['worker_pid'] = pid
+        logging.info('Starting %s indexer in serving process %s', BUILD, pid)
+        indexer_thread.start()
+
+
+@app.before_request
+def start_worker_indexer():
+    start_indexer()
 
 if __name__ == '__main__':
     from waitress import serve
+    start_indexer()
     port = int(os.getenv('PORT', '8093'))
     serve(app, host='0.0.0.0', port=port, threads=4)
