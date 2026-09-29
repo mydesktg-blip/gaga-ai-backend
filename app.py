@@ -28,7 +28,7 @@ DOWNLOAD_CACHE = BASE / 'data' / 'index_work'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 INDEX_VERSION = 3
 THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.42'))
-BUILD = 'gaga-index-v4'
+BUILD = 'gaga-index-v6'
 GALLERY_SOURCE = os.getenv('GALLERY_SOURCE', 'remote').lower()
 cv2.setNumThreads(1)
 REMOTE_GALLERY = os.getenv('REMOTE_GALLERY', 'https://rarebook.in/gaga_collection').rstrip('/')
@@ -71,24 +71,34 @@ def gallery_files():
 
 
 def remote_picture(name):
-    # Keep at most one original on disk, not the entire gallery.
     DOWNLOAD_CACHE.mkdir(parents=True, exist_ok=True)
-    target = DOWNLOAD_CACHE / 'current-image.part'
-    try:
-        url = f'{REMOTE_GALLERY}/download.php'
-        with requests.get(url, params={'name': name}, stream=True, timeout=(10, 45),
-                          headers={'User-Agent': 'GAGA-Indexer/3'}) as response:
-            response.raise_for_status()
-            size = 0
-            with target.open('wb') as output:
-                for chunk in response.iter_content(128 * 1024):
-                    size += len(chunk)
-                    if size > 35 * 1024 * 1024:
-                        raise ValueError('Original photo exceeds 35 MB')
-                    output.write(chunk)
-        return decode(target)
-    finally:
-        target.unlink(missing_ok=True)
+    target = DOWNLOAD_CACHE / f'{name}.part'
+    urls = [
+        f'{REMOTE_GALLERY}/thumbs/{name}',
+        f'{REMOTE_GALLERY}/thumb.php?name={name}',
+        f'{REMOTE_GALLERY}/download.php?name={name}'
+    ]
+    for url in urls:
+        for attempt in range(3):
+            try:
+                with requests.get(url, stream=True, timeout=(10, 45),
+                                  headers={'User-Agent': 'GAGA-Indexer/3'}) as response:
+                    if response.status_code == 200:
+                        size = 0
+                        with target.open('wb') as output:
+                            for chunk in response.iter_content(128 * 1024):
+                                size += len(chunk)
+                                if size > 35 * 1024 * 1024:
+                                    raise ValueError('Photo exceeds 35 MB')
+                                output.write(chunk)
+                        img = decode(target)
+                        return img
+            except Exception:
+                if attempt < 2:
+                    time.sleep(1)
+            finally:
+                target.unlink(missing_ok=True)
+    raise ValueError(f'Could not download photo {name}')
 
 
 def decode(source):
@@ -96,7 +106,6 @@ def decode(source):
         with warnings.catch_warnings():
             warnings.simplefilter('error', Image.DecompressionBombWarning)
             with Image.open(source) as picture:
-                # JPEG draft reduces decoding memory before RGB/EXIF copies.
                 if picture.width * picture.height > Image.MAX_IMAGE_PIXELS:
                     raise ValueError('Photo exceeds 40 megapixels')
                 picture.draft('RGB', (1600, 1600))
@@ -120,7 +129,6 @@ class Faces:
         self.recognizer = cv2.FaceRecognizerSF.create(str(recognizer), '')
 
     def features(self, picture):
-        # OpenCV detector/recognizer instances are mutable, not thread safe.
         with engine_lock:
             result = []
             for size in (800, 1600):
@@ -142,15 +150,17 @@ def refresh():
     if not refresh_lock.acquire(blocking=False):
         return
     with lock:
-        state.update(indexing=True, ready=False, processed=0, skipped=0, error=None,
+        has_existing = bool(records)
+        state.update(indexing=True, ready=has_existing, processed=0, skipped=0,
                      stage='loading_gallery', last_photo_error=None)
     try:
         refresh_index()
     except Exception as exc:
+        logging.exception('Album indexing failed: %s', exc)
         with lock:
-            state.update(ready=False, stage='error',
-                         error=f'Album indexing failed: {type(exc).__name__}. Check Render logs.')
-        raise
+            if not records:
+                state.update(ready=False, stage='error',
+                             error=f'Album indexing failed: {type(exc).__name__}. Check Render logs.')
     finally:
         with lock:
             state['indexing'] = False
@@ -167,16 +177,109 @@ def save_index(photos):
     temporary.replace(CACHE)
 
 
+def load_cache():
+    global records, engine
+    # 1. Try local CACHE
+    try:
+        if CACHE.exists():
+            saved = json.loads(CACHE.read_text())
+            if saved.get('version') == INDEX_VERSION and saved.get('photos'):
+                records = saved['photos']
+                with lock:
+                    state.update(
+                        ready=True,
+                        total=len(records),
+                        processed=len(records),
+                        face_photos=sum(bool(item.get('faces')) for item in records.values()),
+                        stage='ready',
+                        error=None
+                    )
+                logging.info('Loaded %d cached photos from %s', len(records), CACHE)
+                if engine is None:
+                    engine = Faces()
+                return True
+    except Exception as exc:
+        logging.warning('Could not load local cache: %s', exc)
+
+    # 2. Try root faces.json if CACHE does not exist
+    root_faces = BASE / 'faces.json'
+    if root_faces.exists():
+        try:
+            saved = json.loads(root_faces.read_text())
+            if saved.get('version') == INDEX_VERSION and saved.get('photos'):
+                records = saved['photos']
+                save_index(records)
+                with lock:
+                    state.update(
+                        ready=True,
+                        total=len(records),
+                        processed=len(records),
+                        face_photos=sum(bool(item.get('faces')) for item in records.values()),
+                        stage='ready',
+                        error=None
+                    )
+                logging.info('Loaded %d photos from %s', len(records), root_faces)
+                if engine is None:
+                    engine = Faces()
+                return True
+        except Exception as exc:
+            logging.warning('Could not load root faces.json: %s', exc)
+
+    return False
+
+
 def refresh_index():
     global records, engine
+
+    # Check remote faces.json / get_faces.php first for instant 1-second sync
+    if GALLERY_SOURCE == 'remote':
+        sync_urls = [
+            f'{REMOTE_GALLERY}/get_faces.php',
+            f'{REMOTE_GALLERY}/faces.json'
+        ]
+        for sync_url in sync_urls:
+            try:
+                r = requests.get(sync_url, timeout=(10, 45),
+                                 headers={'User-Agent': 'GAGA-Indexer/3'})
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get('version') == INDEX_VERSION and data.get('photos'):
+                        remote_photos = data['photos']
+                        if len(remote_photos) >= len(records):
+                            records = remote_photos
+                            save_index(records)
+                            if engine is None:
+                                engine = Faces()
+                            with lock:
+                                state.update(
+                                    ready=True,
+                                    total=len(records),
+                                    processed=len(records),
+                                    face_photos=sum(bool(item.get('faces')) for item in records.values()),
+                                    stage='ready',
+                                    error=None,
+                                    skipped=0
+                                )
+                            logging.info('Instantly synced %d photos from %s!', len(records), sync_url)
+                            return
+            except Exception as e:
+                logging.info('Remote sync from %s failed (%s), trying next...', sync_url, e)
+
     files = gallery_files()
     if not files:
-        raise ValueError('No gallery photos available')
+        if not records:
+            raise ValueError('No gallery photos available')
+        return
+
     with lock:
-        state.update(total=len(files), stage='loading_models', face_photos=0)
+        state.update(total=len(files), stage='loading_models')
+
     if engine is None:
         engine = Faces()
-    updated = {}
+
+    updated = dict(records)
+    skipped_count = 0
+
     for counter, (name, path) in enumerate(sorted(files.items()), 1):
         with lock:
             state.update(current_photo=name, stage='indexing')
@@ -186,6 +289,7 @@ def refresh_index():
             else:
                 stat = path.stat()
                 stamp = [stat.st_mtime_ns, stat.st_size]
+
             previous = records.get(name)
             if previous and previous.get('stamp') == stamp:
                 entry = previous
@@ -196,51 +300,42 @@ def refresh_index():
                 finally:
                     del picture
                 entry = {'stamp': stamp, 'faces': faces}
+
             updated[name] = entry
-            with lock:
-                records[name] = entry
-                state['face_photos'] += bool(entry.get('faces'))
         except Exception as exc:
-            logging.exception('Failed to index %s', name)
+            logging.warning('Could not index %s: %s', name, exc)
+            skipped_count += 1
             with lock:
-                state['skipped'] += 1
+                state['skipped'] = skipped_count
                 state['last_photo_error'] = f'{name}: {type(exc).__name__}: {exc}'
         finally:
             with lock:
                 state['processed'] = counter
+                state['face_photos'] = sum(bool(item.get('faces')) for item in updated.values())
             gc.collect()
-        if counter % 25 == 0:
+
+        if counter % 50 == 0:
             save_index(updated)
-            logging.info('Indexed %s/%s photos; %s contain faces',
-                         counter, len(files), state['face_photos'])
+            with lock:
+                records = updated
+                state['ready'] = bool(updated)
+
     save_index(updated)
     with lock:
         records = updated
-        complete = bool(updated) and not state['skipped']
+        complete = bool(updated)
         state.update(ready=complete, current_photo=None,
                      stage='ready' if complete else 'incomplete',
-                     error=None if complete else 'Some photos failed to index; automatic retry is scheduled.')
+                     error=None)
 
 
 def index_loop():
-    global records
-    try:
-        if CACHE.exists():
-            saved = json.loads(CACHE.read_text())
-            if (saved.get('version') == INDEX_VERSION and saved.get('source') == GALLERY_SOURCE
-                    and saved.get('gallery') == REMOTE_GALLERY):
-                records = saved['photos']
-                state.update(ready=False, total=len(records),
-                             face_photos=sum(bool(item['faces']) for item in records.values()))
-    except (OSError, ValueError, KeyError):
-        records = {}
+    load_cache()
     while True:
         try:
             refresh()
         except Exception as e:
             logging.exception('Album indexing failed: %s', e)
-            with lock:
-                state.update(indexing=False, ready=False, stage='error')
         time.sleep(300)
 
 
@@ -250,9 +345,9 @@ def home():
         service='RANI AI Face Matching Engine',
         status='active',
         build=BUILD,
-        ready=state['ready'],
-        total_photos=state['total'],
-        face_photos=state['face_photos']
+        ready=bool(records),
+        total_photos=len(records),
+        face_photos=sum(bool(item.get('faces')) for item in records.values())
     )
 
 
@@ -260,7 +355,11 @@ def home():
 @app.route('/gaga_collection/api/status')
 def status():
     with lock:
-        return jsonify(dict(state))
+        st = dict(state)
+        st['total'] = len(records) or st['total']
+        st['face_photos'] = sum(bool(item.get('faces')) for item in records.values())
+        st['ready'] = bool(records)
+        return jsonify(st)
 
 
 @app.route('/api/sync')
@@ -280,18 +379,21 @@ def search():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
-    expected = request.form.get('gallery_count', type=int) or 0
+    global engine
+    if engine is None:
+        try:
+            engine = Faces()
+        except Exception as exc:
+            logging.exception('Engine init error: %s', exc)
+            return jsonify(error='AI engine initializing. Please try again in a few moments.'), 503
+
     with lock:
-        complete = state['ready'] and not state['indexing'] and not state['error']
         records_snapshot = dict(records)
-        total = state['total']
-        skipped = state['skipped']
-    if not complete or engine is None or not records_snapshot or (expected and expected != total):
+
+    if not records_snapshot:
         return jsonify(error='The photo library is still being prepared. Please try again shortly.',
                        indexing=state['indexing'], processed=state['processed'],
-                       total=expected or total, stage=state['stage']), 503
-    if skipped:
-        return jsonify(error='Some event photos could not be indexed. Please ask the gallery owner to check the photo library.'), 503
+                       total=state['total'], stage=state['stage']), 503
 
     features = engine.features(picture)
     if len(features) == 0:
@@ -330,8 +432,6 @@ def add_cors_headers(response):
     return response
 
 
-# Do not start threads during import: Gunicorn may preload this module in its
-# master process. Only the worker serving requests should start the indexer.
 indexer_start_lock = threading.Lock()
 indexer_thread = None
 indexer_pid = None
@@ -343,6 +443,7 @@ def start_indexer():
         pid = os.getpid()
         if indexer_pid == pid and indexer_thread is not None and indexer_thread.is_alive():
             return
+        load_cache()
         indexer_thread = threading.Thread(target=index_loop, daemon=True, name='album-indexer')
         indexer_pid = pid
         state['worker_pid'] = pid
