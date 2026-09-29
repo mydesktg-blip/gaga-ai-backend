@@ -27,8 +27,8 @@ CACHE = BASE / 'data' / 'faces.json'
 DOWNLOAD_CACHE = BASE / 'data' / 'index_work'
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 INDEX_VERSION = 3
-THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.38'))
-BUILD = 'gaga-index-v6'
+THRESHOLD = float(os.getenv('FACE_THRESHOLD', '0.45'))
+BUILD = 'gaga-index-v7'
 GALLERY_SOURCE = os.getenv('GALLERY_SOURCE', 'remote').lower()
 cv2.setNumThreads(1)
 REMOTE_GALLERY = os.getenv('REMOTE_GALLERY', 'https://rarebook.in/gaga_collection').rstrip('/')
@@ -143,6 +143,38 @@ class Faces:
                     result.append(feature.tolist())
                 if max(picture.shape[:2]) <= size:
                     break
+            return result
+
+    def query_features(self, picture):
+        """Extract features exclusively for the primary face(s) in a user selfie,
+        filtering out background bystanders, wall frames, and tiny false faces."""
+        with engine_lock:
+            h, w = picture.shape[:2]
+            scale = min(1.0, 960 / max(h, w))
+            sample = cv2.resize(picture, None, fx=scale, fy=scale) if scale < 1 else picture
+            self.detector.setInputSize((sample.shape[1], sample.shape[0]))
+            _, faces = self.detector.detect(sample)
+            if faces is None or len(faces) == 0:
+                self.detector.setInputSize((w, h))
+                _, faces = self.detector.detect(picture)
+                sample = picture
+
+            if faces is None or len(faces) == 0:
+                return []
+
+            # Sort faces by bounding box area (w * h) descending
+            sorted_faces = sorted(faces, key=lambda f: float(f[2] * f[3]), reverse=True)
+            max_area = float(sorted_faces[0][2] * sorted_faces[0][3])
+
+            # Keep only primary face(s) (>= 50% of the largest face area)
+            primary_faces = [f for f in sorted_faces if float(f[2] * f[3]) >= max_area * 0.50]
+
+            result = []
+            for face in primary_faces:
+                aligned = self.recognizer.alignCrop(sample, face)
+                feature = self.recognizer.feature(aligned).flatten()
+                feature /= max(float(np.linalg.norm(feature)), 1e-12)
+                result.append(feature.tolist())
             return result
 
 
@@ -395,12 +427,12 @@ def search():
                        indexing=state['indexing'], processed=state['processed'],
                        total=state['total'], stage=state['stage']), 503
 
-    features = engine.features(picture)
+    features = engine.query_features(picture)
     if len(features) == 0:
         return jsonify(error='No face detected in the photo. Please use a clear, front-facing selfie.'), 400
 
     query_vectors = [np.array(f, dtype=np.float32) for f in features]
-    matches = []
+    scored = []
     for name, entry in records_snapshot.items():
         if not entry.get('faces'):
             continue
@@ -410,10 +442,22 @@ def search():
             s = float(np.max(face_matrix @ q))
             if s > best_score:
                 best_score = s
-        if best_score >= THRESHOLD:
-            matches.append({'name': name, 'score': round(best_score, 4)})
+        if best_score > 0.35:
+            scored.append((name, best_score))
 
-    matches.sort(key=lambda item: item['score'], reverse=True)
+    scored.sort(key=lambda item: item[1], reverse=True)
+
+    base_threshold = THRESHOLD
+    matches = []
+    if scored and scored[0][1] >= base_threshold:
+        top_score = scored[0][1]
+        # Dynamic threshold: strictly discard photos belonging to other people
+        dynamic_threshold = max(base_threshold, top_score - 0.12)
+        for name, score in scored:
+            if score >= dynamic_threshold:
+                matches.append({'name': name, 'score': round(score, 4)})
+            else:
+                break
     del picture
     del features
     del query_vectors
